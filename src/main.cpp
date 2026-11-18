@@ -1,4 +1,5 @@
-// kong-takehome-rate-limiter —— 考题一：分布式集群限流中间件
+// kong-takehome-rate-limiter - Take-home option 1: distributed cluster
+// rate-limiting middleware.
 //
 // A gateway-side rate-limit middleware: N replicas share one quota pool
 // backed by Redis, with per-request decisions executed atomically in Lua.

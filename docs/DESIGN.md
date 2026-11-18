@@ -1,8 +1,8 @@
-# 设计文档：分布式集群限流中间件
+# Design: distributed cluster rate-limiting middleware
 
-> 考题一（3 选 1）。本文回答作业要求的三件事：**哪些模块精做、哪些合理简化、距离 Production Ready 还差什么**，并给出关键决策的取舍理由。
+> Take-home option 1 (choose 1 of 3). This document answers the three questions the brief asks for: **which modules are built to a high standard, which are deliberately simplified, and what is missing for production readiness**, along with the reasoning behind every major trade-off.
 
-## 1. 系统架构
+## 1. System architecture
 
 ```mermaid
 flowchart LR
@@ -10,120 +10,120 @@ flowchart LR
     C1[client A<br/>X-Client-ID / XFF]
     C2[client B]
   end
-  subgraph cluster [Gateway cluster · N replicas, 无状态]
-    G1[replica :8081<br/>规则缓存 + 限流判定]
-    G2[replica :8082<br/>规则缓存 + 限流判定]
-    G3[replica :8083<br/>规则缓存 + 限流判定]
+  subgraph cluster [Gateway cluster · N stateless replicas]
+    G1[replica :8081<br/>rule cache + limiter]
+    G2[replica :8082<br/>rule cache + limiter]
+    G3[replica :8083<br/>rule cache + limiter]
   end
-  subgraph redis [Redis · 全局唯一状态]
-    Q[(配额计数 key<br/>rl:v1:*, 带 TTL)]
-    CFG[(配置 hash<br/>rl:config:rules<br/>+ version)]
+  subgraph redis [Redis · the only shared state]
+    Q[(quota keys<br/>rl:v1:*, TTL-backed)]
+    CFG[(config hash<br/>rl:config:rules<br/>+ version key)]
   end
   UP[Upstream]
 
   C1 --> G1 & G2 & G3
   C2 --> G1 & G2 & G3
-  G1 -- "EVALSHA（Lua 原子执行）" --> Q
-  G2 -- "EVALSHA（Lua 原子执行）" --> Q
-  G3 -- "EVALSHA（Lua 原子执行）" --> Q
-  G1 -. 版本轮询 .-> CFG
-  G2 -. 版本轮询 .-> CFG
-  G3 -. 版本轮询 .-> CFG
-  G1 & G2 & G3 -- 放行则代理 --> UP
+  G1 -- "EVALSHA (atomic Lua)" --> Q
+  G2 -- "EVALSHA (atomic Lua)" --> Q
+  G3 -- "EVALSHA (atomic Lua)" --> Q
+  G1 -. version poll .-> CFG
+  G2 -. version poll .-> CFG
+  G3 -. version poll .-> CFG
+  G1 & G2 & G3 -- proxy when allowed --> UP
 ```
 
-每个请求的处理链：**规则匹配（本地内存）→ 对每个命中规则发起一次 EVALSHA（Redis Lua 原子判定）→ 任一拒绝即 429，否则代理上游/本地回显**。副本本身不持有任何计数状态，扩缩容、重启不影响配额正确性。
+Per-request pipeline: **match rules (local memory) -> one EVALSHA per matched rule (atomic Lua decision in Redis) -> 429 on any denial, else proxy upstream / local echo**. Replicas hold zero counting state, so scaling, restarts and request drift never affect quota correctness.
 
-## 2. 限流算法取舍
+## 2. Algorithm trade-offs
 
-三种算法共用一套规则模型（`limit` + `window_ms`），通过同一接口切换：
+All three algorithms share one rule model (`limit` + `window_ms`) and are switched by the `algorithm` field:
 
-| | 固定窗口 | 滑动窗口（ZSET） | 令牌桶 |
+| | Fixed window | Sliding window (ZSET) | Token bucket |
 |---|---|---|---|
-| 精度 | 中：窗口边界最多 2× 突发 | 高：任意时刻回看 window 毫秒内请求数 | 高：桶内令牌数连续 |
-| Redis 状态 | string（INCR/PEXPIRE） | zset（成员=请求时间戳） | hash（t/tok） |
-| 每请求开销 | O(1)，1~2 条命令 | O(log n)，需要 ZREMRANGEBYSCORE+ZADD | O(1) |
-| 突发特性 | 窗口初可突发 limit 个 | 平滑 | 允许 burst，匀速补充 |
-| Retry-After 质量 | = PTTL，精确 | = 最老成员出窗时间，精确 | = 攒够 1 令牌的时间，精确 |
-| 适用 | 低成本粗控 | 精确窗口控流 | 保护下游、削峰填谷 |
+| Precision | medium: up to 2x burst at window edges | high: exact count over the trailing window | high: continuous token level |
+| Redis state | string (INCR/PEXPIRE) | zset (member per request timestamp) | hash (t/tok) |
+| Per-request cost | O(1), 1-2 commands | O(log n), ZREMRANGEBYSCORE+ZADD | O(1) |
+| Burst shape | limit-sized burst at window start | smooth | burst allowed, steady refill |
+| Retry-After quality | = PTTL, exact | = time until oldest member leaves, exact | = time to earn 1 token, exact |
+| Best for | cheap coarse control | precise window control | protecting backends, peak shaving |
 
-**取舍结论**：三者在「精度 / 状态成本 / 突发形态」上互有胜负，所以不做单算法拍脑袋选型，而是把算法变成规则的可配置项（`algorithm` 字段），由业务按场景选择——这本身就是限流插件最重要的工程权衡。Lua 脚本见 `src/lua_scripts.h`。
+**Conclusion**: the three algorithms trade precision / state cost / burst shape against each other differently, so instead of betting on one, the algorithm is a per-rule configuration (`algorithm` field) chosen by the business scenario — that configurability is itself the most important engineering trade-off for a rate-limiting plugin. See `src/lua_scripts.h` for the scripts.
 
-## 3. 关键设计决策
+## 3. Key design decisions
 
-### 3.1 强一致语义 = Redis Lua 原子执行（核心）
+### 3.1 Strong consistency = atomic Lua execution in Redis (the core)
 
-多副本共享配额池的正确性，取决于「判定+计数」是否原子。把 `INCR` 和 `PEXPIRE` 拆成两条命令执行，在并发下会泄漏无 TTL 的脏 key、或错误重置窗口；ZSET/令牌桶的读改写同理。因此**所有判定逻辑整体放进 Lua 脚本，经 EVALSHA 在 Redis 服务端原子执行**——对任意数量副本、任意并发，效果等价于单机锁 + 单机计数，这就是本方案的「N 节点同一配额池强一致」的实现含义（Redis 单实例即串行点；Redis 自身高可用见 §5）。
+Correctness of a shared quota pool across replicas depends on whether "decide + count" is atomic. Splitting `INCR` and `PEXPIRE` into two commands races under concurrency: it leaks keys without TTL or resets windows incorrectly; ZSET and token-bucket read-modify-writes race the same way. Therefore **all decision logic runs inside a Lua script via EVALSHA, atomic with respect to every other client of the Redis server** — for any number of replicas at any concurrency the effect equals single-node locking + counting. That is what "N nodes agree on one quota pool" means in this design (the Redis single instance is the serialization point; its own HA is §5).
 
-### 3.2 EVALSHA + NOSCRIPT 自愈
+### 3.2 EVALSHA + NOSCRIPT self-healing
 
-脚本在连接建立时 `SCRIPT LOAD` 缓存 SHA，运行期按 SHA 调用省掉脚本传输。NOSCRIPT（Redis 重启/SCRIPT FLUSH）返回发生在**执行之前**，因此捕获后重新 LOAD 再执行一次是安全的——这个「何时可安全重试」的边界在代码注释里明确标出。
+Scripts are `SCRIPT LOAD`ed once per connection and invoked by SHA, saving the script transfer. NOSCRIPT (Redis restart / SCRIPT FLUSH) is returned **before** execution, so catching it, reloading and retrying once is safe — the "when is retry safe" boundary is marked explicitly in the code.
 
-### 3.3 时钟源：Redis TIME，而不是各副本本地钟
+### 3.3 Clock source: Redis TIME, not replica-local clocks
 
-滑动窗口与令牌桶的脚本内直接 `redis.call('TIME')` 取 Redis 服务器时钟。若由各副本取本机时间，跨主机的毫秒级时钟漂移会直接变成配额计算误差；集中由 Redis 出时间后，任何副本发起的判定都在同一时钟域内。固定窗口靠 key TTL 天然规避了时钟问题。代价：每次判定多一次 TIME 调用（Redis 内部为 O(1)，实测可忽略）。
+The sliding-window and token-bucket scripts call `redis.call('TIME')` inside the script to take the Redis server's clock. If each replica used its local clock, cross-host millisecond clock skew would feed directly into quota math; centralizing time in Redis puts every decision in one clock domain no matter which replica issued it. Fixed windows sidestep clocks entirely by relying on key TTL. Cost: one extra TIME call per decision (O(1) internally, negligible in practice).
 
-### 3.4 命令重试语义：写前失败可重试，写后失败不可重试
+### 3.4 Command retry semantics: pre-write failure retryable, post-write failure not
 
-手写 RESP 客户端（`src/redis.cpp`）的 `command()`：socket 写入失败 → 命令可能根本没到 Redis → 断连重试安全；**读取回复失败 → 命令可能已执行 → 绝不自动重试**，把歧义交给上层走降级策略。这是对「重试只能用于幂等或未到端」这条底线的直接落地。
+The hand-written RESP client (`src/redis.cpp`) `command()`: a socket write failure means the command may never have reached Redis -> reconnect and retry is safe; a **read failure means the command may already have executed -> never auto-retry** — the ambiguity is surfaced to the caller, which applies the configured fail-open/fail-closed policy. This is the direct implementation of "retry is only valid for idempotent or never-delivered commands".
 
-### 3.5 降级策略：fail-open 为默认，fail-closed 可配
+### 3.5 Degradation policy: fail-open by default, fail-closed configurable
 
-Redis 挂掉时限流器不能再提供正确判定，只剩两个选择：跟着挂（fail-closed，503）或裸奔（fail-open，放行并打 `X-RateLimit-Degraded` 标）。默认 fail-open：限流是保护性而非准入性功能，让它把业务一起拖死违背网关可用性定位；支付类关键路径应显式 `--fail-closed`。该行为在集成测试中有真实断 Redis 的断言。
+When Redis is down the limiter can no longer decide correctly; the only choices are to go down with it (fail-closed, 503) or run blind (fail-open, allow + `X-RateLimit-Degraded` marker). Default is fail-open: rate limiting is protective, not an admission function, and letting it kill business availability contradicts a gateway's purpose; payment-grade paths should set `--fail-closed` explicitly. Both paths are asserted in integration tests against a real Redis shutdown.
 
-### 3.6 配置下发：Redis hash + 版本号轮询，而非 Pub/Sub 推送
+### 3.6 Config distribution: Redis hash + version polling, not Pub/Sub push
 
-规则存 `rl:config:rules` hash，变更时 `INCR rl:config:version`；副本每 `--poll-ms`（默认 1s）比对版本号，变化才 HGETALL 全量拉取。**选拉不推的理由**：拉模式对副本断连/重启/丢消息天然免疫——错过任意个轮询周期，下一个周期照样收敛到最新版本，不需要维护订阅连接状态、不需要处理推送与请求连接共存。代价是下发延迟 ≈ 一个轮询周期（演示中 0.8s 收敛）。推送模式（Pub/Sub + 变更日志补偿）列为生产增强项。
+Rules live in the `rl:config:rules` hash; every mutation `INCR`s `rl:config:version`; replicas compare the version every `--poll-ms` (default 1s) and only then HGETALL a full reload. **Why pull over push**: pull is stateless across replica reconnects/restarts/message loss — however many polling periods are missed, the next tick converges to the latest version, with no subscription state or push/request connection coexistence to manage. The trade is push-down latency ~= one poll interval (the demo converges in 0.8s). Push mode (Pub/Sub + change-log backfill) is listed as a production enhancement.
 
-### 3.7 维度与 key 设计
+### 3.7 Dimension and key design
 
-`rl:v1:<algo>:<rule_id>:<dim>:<hex(值前96B)>:<fnv1a64(全值)>:<window_ms>`：
+`rl:v1:<algo>:<rule_id>:<dim>:<hex(value[0:96])>:<fnv1a64(value)>:<window_ms>`:
 
-- hex 编码使任意 path/header 内容都能安全做 key；前 96B 截断控制 key 长度，FNV-1a/64 覆盖全值消除截断碰撞；
-- 带 `window_ms` 后缀：改窗口即换 key 空间，老窗口自然过期，避免新旧窗口串数；
-- 所有 key 在 Lua 内 `PEXPIRE`，空闲配额状态自动回收，无泄漏。
+- hex encoding makes arbitrary path/header content safe as a key; the 96-byte bound caps key length, and the FNV-1a/64 over the full value eliminates truncation collisions;
+- the `window_ms` suffix: changing the window rotates the key space, so old and new windows never mix;
+- every key is `PEXPIRE`d inside the Lua script, so idle quota state reaps automatically — no leak.
 
-### 3.8 X-Forwarded-For 信任边界
+### 3.8 X-Forwarded-For trust boundary
 
-`ip` 维度默认取 XFF 首跳（网关前置 LB 的标准形态），可用 `--no-xff` 关闭回退到对端地址。已知边界：未关 XFF 时直连客户端可伪造首跳 IP 逃逸限流——生产应由 LB 覆写该头或收口网络层（见 §5）。
+The `ip` dimension takes the first XFF hop by default (standard shape behind an LB) with `--no-xff` to fall back to the socket peer. Known boundary: with XFF on, a directly-connected client can spoof the first hop to escape IP limiting — production must have the LB overwrite the header or enforce it at the network layer (§5).
 
-### 3.9 线程模型
+### 3.9 Threading model
 
-httplib 工作线程池（每连接一请求）+ `thread_local` Redis 长连接。每 worker 顺序处理请求，连接无并发交错；断线在下一次命令时重建并重载脚本。规则读走 `shared_mutex` 保护的不可变快照（`shared_ptr<const Rule>`），热路径无写锁。
+httplib worker thread pool (one request per connection at a time) + `thread_local` Redis long connections. Each worker processes requests sequentially, so a connection is never interleaved; a broken connection is rebuilt on the next command with script reload. Rule reads go through an immutable snapshot (`shared_ptr<const Rule>`) behind a `shared_mutex` — zero write locks on the hot path.
 
-## 4. 方案边界
+## 4. Scope boundaries
 
-**精做（有完整实现 + 测试覆盖）：**
+**Built to a high standard (full implementation + test coverage):**
 
-- Lua 原子判定内核 ×3 算法，EVALSHA/NOSCRIPT 自愈，Redis TIME 时钟源
-- 手写 RESP 协议层与连接管理（非 hiredis），含安全的重试边界
-- 三维度 key 提取与编码、XFF 信任边界
-- 标准 429/Retry-After/X-RateLimit-* 协议面
-- Redis 配置中枢 + 版本轮询收敛（多副本动态下发，有双实例收敛断言）
-- fail-open/fail-closed 两种降级路径（有真实断 Redis 的断言）
-- 管理 API 全量校验（400/404/502 语义）
+- the Lua decision kernel x3 algorithms, EVALSHA/NOSCRIPT self-healing, Redis TIME clock source
+- hand-written RESP protocol layer and connection management (no hiredis), including safe retry boundaries
+- three-dimension key extraction/encoding, XFF trust boundary
+- standard 429/Retry-After/X-RateLimit-* protocol surface
+- Redis config hub + version-polling convergence (multi-replica dynamic push, two-replica convergence asserted)
+- both degradation paths, fail-open and fail-closed (asserted against a real Redis shutdown)
+- full admin API validation (400/404/502 semantics)
 
-**合理简化（MVP 取舍，均已在代码注释/本文标注）：**
+**Deliberately simplified (MVP trade-offs, all flagged in code comments / this doc):**
 
-- 判定逐规则串行 EVALSHA：多规则命中时延迟 ≈ N×RTT，未做 pipeline/多 key 单脚本合并
-- 副本内统计计数为进程内存，未聚合上报
-- 反代仅 http（无 https/TLS 上游）、逐请求新建上游连接（未连接池化）
-- 限流判定与响应头语义固定，未实现分级阈值（warn/kill）与按状态码差异化计费
-- 规则无优先级/权重，命中即全部求值（最多 1 个 429）
+- per-rule serial EVALSHA: with N matched rules, latency ~= N x RTT; no pipelining / single-script multi-key fusion
+- per-replica in-memory stats counters, not aggregated upstream
+- reverse proxy is http-only (no TLS upstream), new upstream connection per request (no pooling)
+- fixed threshold semantics; no warn/kill tiers or per-status-code metering
+- rules have no priority/weight; all matched rules are evaluated (at most one 429)
 
-## 5. 距 Production Ready 的短板（按优先级）
+## 5. Gaps to production readiness (priority order)
 
-1. **Redis 高可用**：Sentinel/Cluster 接入、读写分离与断线自动切换（当前为单点串行判定，挂掉靠降级策略兜底）。
-2. **热点 key 削峰**：高 QPS 下可考虑本地窗口预扣 + Redis 异步校准的混合方案（精度换性能，需重新论证边界突发），或对同 key 判定做短窗口合并（coalescing）。
-3. **可观测性**：Prometheus 指标导出、结构化日志、判定延迟 P99 监控；当前仅有内存计数接口。
-4. **下发通道升级**：Pub/Sub 推送 + 轮询兜底双模，收敛延迟降到毫秒级。
-5. **安全加固**：Redis ACL/TLS；管理 API 鉴权（mTLS/OAuth2）；XFF 收口策略下发。
-6. **性能工程**：pipeline 批量判定、上游连接池、请求/响应体流式转发。
-7. **规范对齐**：跟踪 `draft-ietf-httpapi-ratelimit-headers` 定稿（`RateLimit-Remaining/Reset` 标准头）。
-8. **混沌测试**：网络分区、Redis 慢查询、时钟跳变（NTP 大步进）下的回归。
+1. **Redis high availability**: Sentinel/Cluster, automatic failover (today a single serialization point; the degradation policy is the only backstop).
+2. **Hot-key smoothing** at high QPS: a hybrid of local window pre-spend + async Redis reconciliation (accuracy for performance; boundary bursts need re-argumentation), or short-window coalescing of decisions on the same key.
+3. **Observability**: Prometheus metrics, structured logs, decision-latency P99 monitoring; today there is only an in-memory counter endpoint.
+4. **Delivery channel upgrade**: Pub/Sub push + polling backstop, convergence latency down to milliseconds.
+5. **Security hardening**: Redis ACL/TLS; admin API auth (mTLS/OAuth2); XFF enforcement policy.
+6. **Performance engineering**: decision pipelining, upstream connection pool, streaming request/response bodies.
+7. **Spec alignment**: track `draft-ietf-httpapi-ratelimit-headers` (`RateLimit-Remaining/Reset` standard headers).
+8. **Chaos testing**: network partitions, slow Redis, clock steps (NTP jumps) under regression.
 
-## 6. 验证记录
+## 6. Verification record
 
-- `scripts/integration_test.sh`：39 项断言全绿（三算法 × 三维度 × 协议头 × 动态下发 × 双实例收敛 × fail-open/fail-closed × 参数校验）。
-- `scripts/run_demo.sh`：3 副本 + 上游，18 请求轮询恰好放行 6；换客户端独立配额；单副本 PUT 上调 limit 后 0.8s 内全集群收敛（共享计数器下，任一旧副本都会把全局限流压回 6——实测放行 8）。
-- `tests/load.py`：8 线程 × 50 请求轮询 3 副本，limit=100，全集群恰好放行 100（400 并发请求零超发）。
+- `scripts/integration_test.sh`: 39 assertions, all green (3 algorithms x 3 dimensions x protocol headers x dynamic push x two-replica convergence x fail-open/fail-closed x validation).
+- `scripts/run_demo.sh`: 3 replicas + upstream; 18 round-robin requests admit exactly 6; a different client gets an isolated pool; a single-replica PUT raising the limit converges cluster-wide in 0.8s (with a shared counter, any stale replica would cap the global admission back at 6 — measured: 8).
+- `tests/load.py`: 8 threads x 50 requests across 3 replicas at limit=100 admit exactly 100 (zero overspend under 400 concurrent requests).
